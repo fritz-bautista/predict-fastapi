@@ -8,32 +8,36 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from xgboost import XGBClassifier
-
-import joblib  # still needed for scaler/label encoder
+import joblib
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# ------------------ FastAPI ------------------
 app = FastAPI(title="Medical Diagnosis API")
 
 # ------------------ Paths ------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "../model.json")
-SCALER_PATH = os.path.join(BASE_DIR, "../scaler.pkl")
-LABEL_ENCODER_PATH = os.path.join(BASE_DIR, "../label_encoder.pkl")
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+MODEL_PATH = os.path.join(ROOT_DIR, "model.pkl")
+SCALER_PATH = os.path.join(ROOT_DIR, "scaler.pkl")
+LABEL_ENCODER_PATH = os.path.join(ROOT_DIR, "label_encoder.pkl")
 
 # ------------------ Load Model ------------------
-model = XGBClassifier()
-model.load_model(MODEL_PATH)  # JSON load avoids pickle issues
-scaler = joblib.load(SCALER_PATH)
-label_enc = joblib.load(LABEL_ENCODER_PATH)
+model = joblib.load(MODEL_PATH)         # MACHINE LEARNING MODEL
+scaler = joblib.load(SCALER_PATH)       # FEATURE SCALER
+label_enc = joblib.load(LABEL_ENCODER_PATH)  # LABEL ENCODER
 
 # ------------------ Database ------------------
-DB_URL = f"mysql+pymysql://{os.environ.get('DB_USERNAME')}:{os.environ.get('DB_PASSWORD')}@{os.environ.get('DB_HOST')}:{os.environ.get('DB_PORT')}/{os.environ.get('DB_DATABASE')}"
+DB_URL = (
+    f"mysql+pymysql://{os.environ.get('DB_USERNAME')}:"
+    f"{os.environ.get('DB_PASSWORD')}@"
+    f"{os.environ.get('DB_HOST')}:"
+    f"{os.environ.get('DB_PORT')}/"
+    f"{os.environ.get('DB_DATABASE')}"
+)
+
 engine = create_engine(DB_URL)
 
-# ------------------ Request Models ------------------
+# ------------------ Pydantic Models ------------------
 class Symptom(BaseModel):
     name: str
     present: Optional[bool] = True
@@ -49,6 +53,7 @@ class PatientRecord(BaseModel):
 # ------------------ Prediction Endpoint ------------------
 @app.post("/predict")
 def predict_records():
+
     try:
         query = """
             SELECT 
@@ -60,15 +65,22 @@ def predict_records():
             FROM medical_records mr
             JOIN patients p ON mr.patient_id = p.patient_id
         """
+
         df = pd.read_sql(query, engine)
         if df.empty:
             return {"info": "No data available."}
 
-        df['Gender'] = df['Gender'].map({'male': 1, 'm': 1, 'female': 0, 'f': 0}).fillna(0)
+        # Normalize gender
+        df['Gender'] = df['Gender'].map({
+            'male': 1, 'm': 1,
+            'female': 0, 'f': 0
+        }).fillna(0)
 
         # Load disease map
         disease_map = pd.read_sql("SELECT disease_id, disease_name FROM disease", engine)
-        disease_name_to_id = dict(zip(disease_map['disease_name'].str.lower(), disease_map['disease_id']))
+        disease_name_to_id = dict(
+            zip(disease_map['disease_name'].str.lower(), disease_map['disease_id'])
+        )
 
         expected_features = [
             'Age', 'Gender', 'temperature', 'nausea', 'joint_pain', 'abdominal_pain',
@@ -82,7 +94,7 @@ def predict_records():
             'back_pain','knee_ache'
         ]
 
-        # Initialize symptom columns
+        # Initialize all symptom columns to zero
         for f in expected_features[3:]:
             df[f] = 0
 
@@ -101,18 +113,21 @@ def predict_records():
                 symptom_counts.append(count)
             except Exception:
                 symptom_counts.append(0)
+
         df['symptom_count'] = symptom_counts
 
+        # Only rows with enough symptoms
         mask = df['symptom_count'] >= MIN_SYMPTOMS_REQUIRED
         if not mask.any():
             return {"info": "Not enough symptoms for prediction."}
 
         features_df = df.loc[mask, expected_features]
         scaled_features = scaler.transform(features_df)
+
         predictions = model.predict(scaled_features)
         predicted_diseases = label_enc.inverse_transform(predictions)
 
-        # Update DB
+        # Save results to DB
         with engine.begin() as conn:
             for db_id, disease_name in zip(df.loc[mask, 'id'], predicted_diseases):
                 disease_id = disease_name_to_id.get(disease_name.lower())
@@ -122,7 +137,10 @@ def predict_records():
                         {"disease_id": int(disease_id), "diagnosis": disease_name, "id": int(db_id)}
                     )
 
-        return {"info": "Predictions updated", "count": len(predicted_diseases)}
+        return {
+            "info": "Predictions updated successfully",
+            "count": len(predicted_diseases)
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
